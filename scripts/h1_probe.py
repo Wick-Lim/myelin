@@ -33,7 +33,7 @@ import torch
 from myelin.config import TrainConfig
 from myelin.data import get_batch, load_split, markov_corpus
 from myelin.model import MiniGPT
-from myelin.signals import ProductSignal, QuantIndex
+from myelin.signals import FlowSignal, ProductSignal, QuantIndex, StructuralSignal
 
 
 def spearman(a: np.ndarray, b: np.ndarray) -> float:
@@ -82,7 +82,12 @@ def main() -> None:
     else:
         data = load_split(cfg.data_dir, "val")
 
-    scores = ProductSignal().scores(index).numpy()
+    signals = {
+        "product": ProductSignal().scores(index).numpy(),
+        "structural": StructuralSignal().scores(index).numpy(),
+        "flow": FlowSignal().scores(index).numpy(),
+    }
+    scores = signals["product"]
 
     # uniform reference allocation: constant drop distance for every channel
     ref_bits = round(cfg.alloc.avg_bits)
@@ -111,10 +116,12 @@ def main() -> None:
         m.bits.copy_(b)
 
     sens = np.array(sens)
-    rho = spearman(scores[sample], sens)
     result = {
         "n_channels": len(sample),
-        "spearman_rho": rho,
+        "spearman_rho": spearman(scores[sample], sens),
+        "spearman_by_signal": {
+            name: spearman(sc[sample], sens) for name, sc in signals.items()
+        },
         "mean_sensitivity": float(sens.mean()),
         "frac_positive": float((sens > 0).mean()),
     }
