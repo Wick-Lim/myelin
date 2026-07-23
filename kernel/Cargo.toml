@@ -1,0 +1,25 @@
+[package]
+name = "myelin-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "Nested bit-plane storage and bit-serial GEMV for Myelin (Phase 2)"
+license = "MIT"
+
+[lib]
+name = "myelin_kernel"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+python = ["dep:pyo3"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"], optional = true }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1

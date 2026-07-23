@@ -36,20 +36,31 @@ from torch import Tensor
 def plane_decompose(x: Tensor, num_planes: int) -> Tensor:
     """Decompose values in [-1, 1] into sign planes.
 
+    Implementation note — this compares the FIXED input against a running
+    reconstruction ``s`` instead of mutating a residual (``r -= b*2^-i``).
+    The two are identical in exact arithmetic, but the residual form is NOT
+    exact in fp32: within ~16 ulps below a grid boundary the subtraction hits
+    a round-half-even midpoint, the offset collapses onto the grid, and the
+    tie then resolves to the level *above* while the closed form picks the one
+    *below* (verified exhaustively over all f32 in [-1,1], k=1..8: 321
+    mismatching pairs). The running-sum form is exact everywhere: ``s`` only
+    ever holds odd multiples of 2^-i (<= 8 mantissa bits, exactly
+    representable) and f32 comparison is exact.
+
     Args:
         x: tensor of any shape with values in [-1, 1].
         num_planes: number of planes K to emit.
 
     Returns:
         Tensor of shape (K, *x.shape) with entries in {-1, +1}.
-        Sign convention: ties (residual exactly 0) resolve to +1.
+        Sign convention: ties (x exactly on the running sum) resolve to +1.
     """
     planes = []
-    r = x.clone()
+    s = torch.zeros_like(x)
     for i in range(1, num_planes + 1):
-        b = torch.where(r >= 0, 1.0, -1.0).to(x.dtype)
+        b = torch.where(x >= s, 1.0, -1.0).to(x.dtype)
         planes.append(b)
-        r = r - b * (2.0 ** -i)
+        s = s + b * (2.0 ** -i)
     return torch.stack(planes, dim=0)
 
 
@@ -79,8 +90,10 @@ def plane_reconstruct(planes: Tensor, bits: Tensor | int) -> Tensor:
 def quantize_unit(x: Tensor, bits: Tensor) -> Tensor:
     """Mid-rise quantizer on [-1, 1] with per-row bit-width.
 
-    Mathematically identical to ``plane_reconstruct(plane_decompose(x, k), k)``
-    for k = bits[row] (same tie convention: exact grid boundaries round up).
+    Bit-exactly equal to ``plane_reconstruct(plane_decompose(x, k), k)`` for
+    k = bits[row], including at and around grid boundaries (same tie
+    convention: exact boundaries round up). This equality only holds because
+    ``plane_decompose`` uses the running-sum form — see its docstring.
 
     Args:
         x: (R, C) values in [-1, 1].

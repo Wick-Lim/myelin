@@ -45,6 +45,19 @@ uv pip install -p .venv/bin/python -e .
 .venv/bin/python scripts/h1_probe.py runs/matrix/b4.0_uniform_s1337  # H1 (균일 기준)
 ```
 
+## Rust 커널 (Phase 2, `kernel/`)
+
+실제 비트 플레인 저장 + 비트 시리얼 GEMV. Phase 1의 fake quant와 달리 연산·메모리가
+할당 비트에 선형이다. `pack→dequantize`는 Python `quantize_rows`와 **비트 단위 일치**
+(골든 계약, 퍼즈 + 실제 체크포인트로 검증).
+
+```bash
+cd kernel && cargo test                 # 골든 계약 포함 11개 테스트
+cargo run --release --example bench     # 비트 선형성 확인
+maturin develop --release --features python   # PyO3 확장 빌드 (maturin 필요)
+cd .. && .venv/bin/python scripts/validate_kernel.py runs/demo/b4.0_connectivity_s7
+```
+
 ## 저장소 구조
 
 ```
@@ -55,11 +68,18 @@ myelin/
   allocator.py   제로섬 waterfilling + 주기 재배분 (코사인 감쇠, deadband)
   model.py       MiniGPT (블록 Linear 6종만 양자화, 역할 태깅)
   train.py       학습 루프, 이중 평가(val_loss / val_loss_fp), 궤적 로깅
+kernel/
+  src/bitplane.rs  패킹/복원 (Python quantize_rows와 비트 단위 일치 계약)
+  src/gemv.rs      비트 시리얼 GEMV (비용 ∝ 비트 수)
+  src/py.rs        PyO3 바인딩 (feature "python")
+  tests/golden.rs  Python 생성 골든 벡터 대조
 scripts/
   prepare_data.py  kowiki → BPE → train.bin/val.bin
   run_matrix.py    실험 매트릭스 러너 (병렬, 스레드 분배, 재개 가능)
   analyze.py       H2/H3 집계
-  h1_probe.py      H1 민감도-연결성 상관 프로브
+  h1_probe.py      H1 민감도-연결성 상관 프로브 (균일 기준 강등)
+  gen_golden.py    Rust/RTL 골든 벡터 생성
+  validate_kernel.py  Rust 커널 ↔ Python 크로스 검증 (퍼즈 + 체크포인트)
 tests/             포맷 성질·불변식이 전부 테스트로 고정됨
 ```
 

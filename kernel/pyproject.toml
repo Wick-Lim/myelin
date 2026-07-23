@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "myelin-kernel"
+version = "0.1.0"
+description = "Bit-plane storage and bit-serial GEMV for Myelin (PyO3 bindings)"
+requires-python = ">=3.10"
+
+[tool.maturin]
+features = ["python"]
+module-name = "myelin_kernel"

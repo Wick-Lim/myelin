@@ -11,35 +11,68 @@ from myelin.bitplane import (
 MAX_BITS = 8
 
 
-def _interior_x(n_rows, n_cols, k, seed=0):
-    """Uniform samples in [-1, 1] excluding points near k-bit cell boundaries
-    (where fp tie-breaking may legitimately differ between implementations)."""
+def _random_x(n_rows, n_cols, seed=0):
     g = torch.Generator().manual_seed(seed)
-    x = torch.rand(n_rows, n_cols, generator=g) * 2 - 1
+    return torch.rand(n_rows, n_cols, generator=g) * 2 - 1
+
+
+def _boundary_x(k, ulps=16):
+    """All k-bit grid boundaries in [-1, 1] plus ladders of `ulps` values
+    immediately below and above each — the exact window where a residual-form
+    decomposition diverges from the closed form."""
     delta = 2.0 ** (1 - k)
-    y = x / delta
-    d = (y - torch.round(y)).abs()
-    x[d < 1e-3] = 0.1234  # replace boundary-adjacent points with an interior value
-    return x
+    grid = torch.arange(-2 ** (k - 1), 2 ** (k - 1) + 1, dtype=torch.float32) * delta
+    xs = [grid]
+    lo, hi = torch.full_like(grid, -2.0), torch.full_like(grid, 2.0)
+    below, above = grid.clone(), grid.clone()
+    for _ in range(ulps):
+        below = torch.nextafter(below, lo)
+        above = torch.nextafter(above, hi)
+        xs.extend([below.clone(), above.clone()])
+    x = torch.cat(xs)
+    return x.clamp(-1.0, 1.0).unsqueeze(0)
 
 
-def test_closed_form_equals_plane_reconstruction():
+def test_closed_form_equals_plane_reconstruction_bit_exact():
     for k in range(1, MAX_BITS + 1):
-        x = _interior_x(16, 512, k, seed=k)
+        x = _random_x(16, 512, seed=k)
         planes = plane_decompose(x, k)
         ref = plane_reconstruct(planes, k)
         bits = torch.full((x.shape[0],), k, dtype=torch.long)
         got = quantize_unit(x, bits)
-        assert torch.allclose(got, ref, atol=1e-6), f"mismatch at k={k}"
+        assert torch.equal(got, ref), f"mismatch at k={k}"
+
+
+def test_closed_form_equals_planes_at_grid_boundaries():
+    # regression for the round-half-even collapse: the residual-form
+    # decomposition disagreed with the closed form in ulp-windows below
+    # boundaries; the running-sum form must agree bit-exactly everywhere
+    for k in range(1, MAX_BITS + 1):
+        x = _boundary_x(k)
+        planes = plane_decompose(x, k)
+        ref = plane_reconstruct(planes, k)
+        got = quantize_unit(x, torch.tensor([k]))
+        assert torch.equal(got, ref), f"boundary mismatch at k={k}"
+
+
+def test_reviewer_counterexample_0x3e7fffff():
+    # u = 0.25 - 2^-26: residual-form decomposition yielded 0.375; the
+    # closed form (and the fixed decomposition) yield 0.125
+    u = torch.tensor([0x3E7FFFFF], dtype=torch.int32).view(torch.float32)
+    x = torch.stack([u, torch.tensor([1.0])], dim=1)  # (1, 2) row
+    q = quantize_rows(x, torch.tensor([3]))
+    assert torch.equal(q, torch.tensor([[0.125, 0.875]]))
+    planes = plane_decompose(x, 3)
+    assert torch.equal(plane_reconstruct(planes, 3), torch.tensor([[0.125, 0.875]]))
 
 
 def test_per_row_bits_in_plane_reconstruction():
-    x = _interior_x(8, 256, MAX_BITS, seed=42)
+    x = _random_x(8, 256, seed=42)
     planes = plane_decompose(x, MAX_BITS)
     bits = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8])
     got = quantize_unit(x, bits)
     ref = plane_reconstruct(planes, bits)
-    assert torch.allclose(got, ref, atol=1e-6)
+    assert torch.equal(got, ref)
 
 
 def test_nesting_one_more_plane_refines_by_half_step():

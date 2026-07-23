@@ -29,9 +29,18 @@ q_k(w) = s · Σ_{i=1..k} b_i · 2^{-i},   b_i = sign(잔차_{i-1}),  sign(0) :=
 **성질 (전부 테스트로 고정됨, `tests/test_bitplane.py`):**
 
 1. **중첩성**: `q_{k+1} = q_k ± s·2^{-(k+1)}` — 평면 추가는 기존 평면을 불변으로 둔 채 잔차만 세분한다.
-2. **등가성**: `q_k`는 [-1,1] 위 스텝 `2^{1-k}` 의 mid-rise 균일 양자화기와 정확히 일치한다.
-   학습에서는 이 닫힌형(`quantize_unit`)을 쓰고, 평면 루프(`plane_decompose/reconstruct`)는
-   골든 모델로 유지한다. **이 등가성 테스트가 곧 Phase 2 Rust 커널의 검증 계약이다.**
+2. **등가성 (비트 단위)**: `q_k`는 [-1,1] 위 스텝 `2^{1-k}` 의 mid-rise 균일 양자화기와
+   **비트 단위로** 일치한다. 학습에서는 이 닫힌형(`quantize_unit`)을 쓰고, 평면
+   루프(`plane_decompose/reconstruct`)는 골든 모델로 유지한다.
+   **이 등가성 테스트가 곧 Phase 2 Rust 커널의 검증 계약이다.**
+
+   ⚠ **fp32 함정 (리뷰에서 발견·수정)**: 분해를 "잔차 변형" 형태(`r -= b·2^{-i}`)로
+   구현하면 등가성이 깨진다 — grid 경계 아래 ~16 ulp 창에서 뺄셈이 round-half-even
+   중점에 떨어져 오프셋이 grid 위로 붕괴하고, tie가 닫힌형과 반대 레벨을 고른다
+   (전 f32 [-1,1]×k=1..8 전수에서 321쌍 불일치, 한 스텝 전체 오차). 올바른 형태는
+   **고정된 입력 u를 실행 중 재구성 부분합 s와 비교**하는 것: s는 항상 2^{-i}의 홀수배
+   (가수 ≤8비트, 정확 표현)라 모든 연산이 IEEE 정확이다. Python·Rust 모두 이 형태로
+   구현되었고, 경계 ±16 ulp 래더가 테스트·골든 벡터에 고정되어 있다.
 3. **오차 상한**: `|w − q_k| ≤ s·2^{-k}`.
 4. **스케일 규칙**: `s`는 행 값에만 의존하고 비트 수에 의존하지 않는다(absmax).
    min-max 재적합은 비트 수에 따라 스케일이 달라져 중첩을 깨므로 금지.
@@ -214,14 +223,42 @@ mlp_down + 초반/후반 레이어)을 connectivity 배분이 **자발적으로 
 uniform/kquant 같은 대량-동률 신호에서 예산을 앞쪽 레이어에 몰아주는 깊이 편향을
 만들며 시드 평균으로도 씻기지 않는다 (리뷰에서 실증 후 수정됨).
 
-## 8. Phase 2/3 인터페이스
+## 8. Phase 2/3 인터페이스 — **Phase 2 크레이트 가동 중** (`kernel/`)
 
-- **골든 모델 계약**: `plane_decompose` + `plane_reconstruct` == `quantize_unit` 테스트가
-  Rust 커널이 통과해야 할 스펙이다. Rust 쪽은 (스케일 fp32, 평면 비트팩) 저장 + 채널별
-  가변 평면 GEMV를 구현하고, 같은 입력에 대해 `quantize_rows` 결과와 비트 단위 일치를 검증한다.
+`myelin-kernel` (Rust) 스캐폴드가 구현·검증되었다. Phase 1 학습을 건드리지 않는
+독립 크레이트이며, 골든 계약이 이미 실증된 상태다.
+
+**저장 포맷 (`kernel/src/bitplane.rs`):**
+```
+행(출력 채널)별: scale f32 (absmax, eps 1e-12) + bits u8 + 부호 평면 bits[r]장
+평면: u64 워드 배열, 열 j → 워드 j/64 의 비트 j%64 (LSB-first)
+      비트 1 = +1, 비트 0 = −1 (sign(0):=+1), cols 초과 패딩은 0 (무해 증명됨)
+배치: 행별 평면 연속 저장 → 행 읽기 = bits[r]·words·8 바이트만 스트리밍
+```
+
+**검증된 계약:**
+- `pack → dequantize` == Python `quantize_rows` **비트 단위 일치** (유한 입력 전체) —
+  모든 경로가 IEEE 정확 연산(2의 거듭제곱 나눗셈, 실행 부분합 비교, dyadic 유리수 합)
+  이라 보장되며, 골든 벡터 10케이스(경계 ±16 ulp 래더 포함, `scripts/gen_golden.py` →
+  `kernel/tests/golden.json`) + 무작위 퍼즈 300행렬 + **실제 학습 체크포인트
+  12레이어**에서 실증 (`scripts/validate_kernel.py`).
+- **입력 계약**: 비유한(NaN/inf) 가중치는 Rust가 명시적 에러로 거부한다 — torch는 NaN을
+  전파하고 `f32::max`는 무시하므로, 패킹을 허용하면 조용한 발산만 가능하기 때문.
+  차원 오버플로/OOM급 요청도 프로세스 abort 대신 에러를 낸다 (checked 산술,
+  내부 할당이 입력 크기에 유계임을 증명).
+- GEMV: `y_r = s_r·Σ_i 2^-i·(2S_i − T)` 비트 시리얼 경로가 f64 기준치와 1e-5 상대오차 내.
+
+**실측 (스칼라 커널, i9-10910 1스레드, 768×768):** 연산 시간이 비트 수에 선형
+(2비트 0.57ms → 8비트 2.26ms), dequant+dot 대비 2~3배. 유효 대역폭 0.26 GB/s로
+아직 연산 바운드 — AVX2 pshufb 4-bit LUT(T-MAC 방식)와 평면 블로킹이 다음 최적화이며,
+포맷 변경 없이 내부 루프만 교체된다.
+
+- **PyO3 바인딩**: `cd kernel && maturin develop --release --features python` →
+  `import myelin_kernel; pack_matrix(...).matvec(x)`.
 - **교체 지점**: `BitplaneLinear.forward`의 `fake_quantize_rows` 호출 하나. backward는
   표준 fp32 경로 그대로 (활성 그래디언트는 full precision).
-- **RTL**: 평면 순차 소비 = 비트 시리얼. Rust 커널 결과가 사이클 단위 비교 기준이 된다.
+- **RTL(Phase 3)**: 같은 골든 벡터가 테스트벤치 입력이 되고, Rust 커널 출력이
+  사이클 단위 비교 기준이 된다.
 
 ## 9. 결정 로그 (기획 문서 §9의 해소)
 
