@@ -1,0 +1,30 @@
+{
+  "model": {
+    "vocab_size": 512,
+    "block_size": 128,
+    "n_layer": 2,
+    "n_head": 4,
+    "d_model": 96,
+    "d_ff": 384
+  },
+  "alloc": {
+    "avg_bits": 4.0,
+    "min_bits": 2,
+    "max_bits": 8,
+    "signal_warmup_steps": 100,
+    "period": 100,
+    "k_start": 0.2,
+    "realloc_end_frac": 0.8,
+    "deadband": 0.25
+  },
+  "synthetic": true,
+  "synthetic_vocab": 512,
+  "synthetic_length": 2000000,
+  "steps": 1200,
+  "batch_size": 16,
+  "lr": 0.001,
+  "lr_warmup_steps": 50,
+  "eval_interval": 300,
+  "eval_iters": 20,
+  "log_interval": 50
+}
