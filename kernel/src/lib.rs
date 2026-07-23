@@ -11,7 +11,7 @@ pub mod bitplane;
 pub mod gemv;
 
 pub use bitplane::{dequantize, pack, PackedMatrix, MAX_BITS};
-pub use gemv::{matvec, matvec_dequant};
+pub use gemv::{matvec, matvec_dequant, matvec_scalar};
 
 #[cfg(feature = "python")]
 mod py;

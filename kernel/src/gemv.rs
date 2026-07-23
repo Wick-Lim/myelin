@@ -16,7 +16,22 @@
 use crate::bitplane::{PackedMatrix, STEP};
 
 /// y = M x. `x.len()` must equal `m.cols`.
+///
+/// Dispatches to the AVX2 sign-mask kernel when the CPU supports it,
+/// otherwise falls back to the scalar reference path. Both compute the same
+/// mathematical sum; lane-parallel accumulation may differ from the scalar
+/// path by normal fp reassociation (well inside the 1e-5 contract tolerance).
 pub fn matvec(m: &PackedMatrix, x: &[f32]) -> Vec<f32> {
+    assert_eq!(x.len(), m.cols, "x length {} != cols {}", x.len(), m.cols);
+    #[cfg(target_arch = "x86_64")]
+    if avx2::available() {
+        return avx2::matvec(m, x);
+    }
+    matvec_scalar(m, x)
+}
+
+/// Scalar reference path (also the portable fallback).
+pub fn matvec_scalar(m: &PackedMatrix, x: &[f32]) -> Vec<f32> {
     assert_eq!(x.len(), m.cols, "x length {} != cols {}", x.len(), m.cols);
     let total: f64 = x.iter().map(|&v| v as f64).sum();
     let wpp = m.words_per_plane;
@@ -42,6 +57,93 @@ pub fn matvec(m: &PackedMatrix, x: &[f32]) -> Vec<f32> {
         y.push((m.scales[r] as f64 * acc) as f32);
     }
     y
+}
+
+/// AVX2 kernel: per plane, expand each sign byte (8 columns) into a 256-bit
+/// sign mask via a 256-entry LUT (8 KB, cache-resident), apply signs with a
+/// single XOR against 8 input lanes, and accumulate. Cost per plane is
+/// cols/8 xor+add regardless of bit pattern — unlike the scalar path whose
+/// cost tracks popcount. Zero-padding of x beyond `cols` is harmless: XOR
+/// only flips the sign of 0.0, and +-0.0 is additive identity.
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use std::arch::x86_64::*;
+    use std::sync::OnceLock;
+
+    use crate::bitplane::{PackedMatrix, STEP};
+
+    /// sign masks per byte value: bit set (=+1) -> 0, bit clear (=-1) -> sign flip
+    static SIGN_LUT: OnceLock<Box<[[i32; 8]; 256]>> = OnceLock::new();
+
+    fn sign_lut() -> &'static [[i32; 8]; 256] {
+        SIGN_LUT.get_or_init(|| {
+            let mut t = Box::new([[0i32; 8]; 256]);
+            for (b, entry) in t.iter_mut().enumerate() {
+                for (k, lane) in entry.iter_mut().enumerate() {
+                    *lane = if b >> k & 1 == 1 { 0 } else { i32::MIN };
+                }
+            }
+            t
+        })
+    }
+
+    pub fn available() -> bool {
+        is_x86_feature_detected!("avx2")
+    }
+
+    pub fn matvec(m: &PackedMatrix, x: &[f32]) -> Vec<f32> {
+        let mut xp = vec![0f32; m.words_per_plane * 64];
+        xp[..m.cols].copy_from_slice(x);
+        // SAFETY: gated on runtime avx2 detection in `available()`
+        unsafe { matvec_inner(m, &xp) }
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn matvec_inner(m: &PackedMatrix, xp: &[f32]) -> Vec<f32> {
+        let lut = sign_lut();
+        let wpp = m.words_per_plane;
+        let mut y = Vec::with_capacity(m.rows);
+        for r in 0..m.rows {
+            let base = m.row_offsets[r];
+            let mut acc_row = 0f64;
+            for i in 0..m.bits[r] as usize {
+                let plane = &m.planes[base + i * wpp..base + (i + 1) * wpp];
+                let mut acc0 = _mm256_setzero_ps();
+                let mut acc1 = _mm256_setzero_ps();
+                for (w, &word) in plane.iter().enumerate() {
+                    let col = w * 64;
+                    let mut k = 0usize;
+                    while k < 8 {
+                        let s0 = _mm256_loadu_si256(
+                            lut[(word >> (8 * k)) as usize & 0xFF].as_ptr() as *const __m256i,
+                        );
+                        let x0 = _mm256_loadu_ps(xp.as_ptr().add(col + 8 * k));
+                        acc0 = _mm256_add_ps(acc0, _mm256_xor_ps(x0, _mm256_castsi256_ps(s0)));
+                        let s1 = _mm256_loadu_si256(
+                            lut[(word >> (8 * (k + 1))) as usize & 0xFF].as_ptr() as *const __m256i,
+                        );
+                        let x1 = _mm256_loadu_ps(xp.as_ptr().add(col + 8 * (k + 1)));
+                        acc1 = _mm256_add_ps(acc1, _mm256_xor_ps(x1, _mm256_castsi256_ps(s1)));
+                        k += 2;
+                    }
+                }
+                let d = hsum_f64(acc0) + hsum_f64(acc1);
+                acc_row += STEP[i + 1] as f64 * d;
+            }
+            y.push((m.scales[r] as f64 * acc_row) as f32);
+        }
+        y
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn hsum_f64(v: __m256) -> f64 {
+        let lo = _mm256_cvtps_pd(_mm256_castps256_ps128(v));
+        let hi = _mm256_cvtps_pd(_mm256_extractf128_ps(v, 1));
+        let s = _mm256_add_pd(lo, hi);
+        let mut out = [0f64; 4];
+        _mm256_storeu_pd(out.as_mut_ptr(), s);
+        out[0] + out[1] + out[2] + out[3]
+    }
 }
 
 /// Reference path: dequantize the row, then a plain f64 dot product.
@@ -78,13 +180,44 @@ mod tests {
             let bits: Vec<u8> = (0..rows).map(|r| (r % 8) as u8 + 1).collect();
             let x: Vec<f32> = (0..cols).map(|_| lcg_f32(&mut s)).collect();
             let m = pack(&w, rows, cols, &bits).unwrap();
-            let a = matvec(&m, &x);
             let b = matvec_dequant(&m, &x);
+            for (label, a) in [("dispatch", matvec(&m, &x)), ("scalar", matvec_scalar(&m, &x))] {
+                for (i, (&va, &vb)) in a.iter().zip(&b).enumerate() {
+                    let tol = 1e-5 * vb.abs().max(1.0);
+                    assert!(
+                        (va - vb).abs() <= tol,
+                        "({rows}x{cols}) {label} row {i}: {va} vs dequant {vb}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn avx2_and_scalar_agree_on_awkward_shapes() {
+        // shapes chosen to stress word padding (cols % 64 != 0) and tiny sizes
+        let mut s = 5u64;
+        for &(rows, cols) in &[
+            (1usize, 1usize),
+            (2, 7),
+            (3, 63),
+            (3, 64),
+            (3, 65),
+            (4, 100),
+            (2, 191),
+            (1, 1024),
+        ] {
+            let w: Vec<f32> = (0..rows * cols).map(|_| lcg_f32(&mut s) * 3.0).collect();
+            let bits: Vec<u8> = (0..rows).map(|r| (r % 8) as u8 + 1).collect();
+            let x: Vec<f32> = (0..cols).map(|_| lcg_f32(&mut s)).collect();
+            let m = pack(&w, rows, cols, &bits).unwrap();
+            let a = matvec(&m, &x);
+            let b = matvec_scalar(&m, &x);
             for (i, (&va, &vb)) in a.iter().zip(&b).enumerate() {
                 let tol = 1e-5 * vb.abs().max(1.0);
                 assert!(
                     (va - vb).abs() <= tol,
-                    "({rows}x{cols}) row {i}: bitserial {va} vs dequant {vb}"
+                    "({rows}x{cols}) row {i}: dispatch {va} vs scalar {vb}"
                 );
             }
         }

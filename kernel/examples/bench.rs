@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use myelin_kernel::{matvec, matvec_dequant, pack};
+use myelin_kernel::{matvec, matvec_dequant, matvec_scalar, pack};
 
 fn lcg_f32(state: &mut u64) -> f32 {
     *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -31,7 +31,13 @@ fn main() {
         for _ in 0..iters {
             sink += matvec(&m, &x)[0];
         }
-        let dt_serial = t0.elapsed().as_secs_f64() / iters as f64;
+        let dt_simd = t0.elapsed().as_secs_f64() / iters as f64;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            sink += matvec_scalar(&m, &x)[0];
+        }
+        let dt_scalar = t0.elapsed().as_secs_f64() / iters as f64;
 
         let t0 = Instant::now();
         for _ in 0..iters {
@@ -41,9 +47,10 @@ fn main() {
 
         let mb = m.plane_bytes() as f64 / 1e6;
         println!(
-            "bits {avg_bits}: planes {mb:.3} MB | bit-serial {:.3} ms ({:.2} GB/s eff) | dequant+dot {:.3} ms | sink {sink:.1}",
-            dt_serial * 1e3,
-            mb / 1e3 / dt_serial,
+            "bits {avg_bits}: planes {mb:.3} MB | simd {:.3} ms ({:.2} GB/s eff) | scalar {:.3} ms | dequant+dot {:.3} ms | sink {sink:.1}",
+            dt_simd * 1e3,
+            mb / 1e3 / dt_simd,
+            dt_scalar * 1e3,
             dt_dequant * 1e3,
         );
     }
